@@ -270,7 +270,9 @@ uint8_t nearestEpdColor(uint16_t rgb565) {
   return bestCode;
 }
 
-bool cacheSdPicture(const char* path, uint8_t** destination) {
+bool cacheSdPicture(const char* path,
+                    uint8_t** destination,
+                    bool reuseCanvasBuffer = false) {
   if (!SD.exists(path)) {
     Serial.printf("Cache open failed: %s\n", path);
     return false;
@@ -286,7 +288,9 @@ bool cacheSdPicture(const char* path, uint8_t** destination) {
     return false;
   }
 
-  *destination = static_cast<uint8_t*>(malloc(SD_PACKED_IMAGE_BYTES));
+  *destination = reuseCanvasBuffer
+                   ? static_cast<uint8_t*>(imageCanvas.getBuffer())
+                   : static_cast<uint8_t*>(malloc(SD_PACKED_IMAGE_BYTES));
   if (!*destination) {
     Serial.printf("Cache pixel allocation failed: %s, free=%u\n", path,
                   static_cast<unsigned>(ESP.getFreeHeap()));
@@ -309,14 +313,15 @@ bool cacheSdPicture(const char* path, uint8_t** destination) {
 bool cacheSdPictures() {
   if (!sdReady) return false;
   const bool closedOk = cacheSdPicture(SD_CLOSED_PATH, &sdClosedPixels);
-  const bool openOk = cacheSdPicture(SD_OPEN_PATH, &sdOpenPixels);
+  // OPEN is converted last. Compact it in-place into the first half of the
+  // 8-bit canvas and retain that canvas as its 4-bit packed storage.
+  const bool openOk = cacheSdPicture(SD_OPEN_PATH, &sdOpenPixels, true);
   Serial.printf("SD image cache: close=%s, open=%s, free=%u\n",
                 closedOk ? "OK" : "failed",
                 openOk ? "OK" : "failed",
                 static_cast<unsigned>(ESP.getFreeHeap()));
   if (closedOk && openOk) return true;
   free(sdClosedPixels);
-  free(sdOpenPixels);
   sdClosedPixels = nullptr;
   sdOpenPixels = nullptr;
   return false;
@@ -868,18 +873,10 @@ void setup() {
   digitalWrite(EPD_MOSI, LOW);
   digitalWrite(EPD_SCLK, LOW);
 
-  imageCanvas.setColorDepth(4);
+  imageCanvas.setColorDepth(8);
   if (!imageCanvas.createSprite(240, 400)) {
     Serial.println("Could not allocate SD image canvas");
   }
-  imageCanvas.setPaletteColor(0, TFT_BLACK);
-  imageCanvas.setPaletteColor(1, TFT_WHITE);
-  imageCanvas.setPaletteColor(2, TFT_YELLOW);
-  imageCanvas.setPaletteColor(3, TFT_RED);
-  imageCanvas.setPaletteColor(4, 0x7BEF);  // mid gray
-  imageCanvas.setPaletteColor(5, TFT_BLUE);
-  imageCanvas.setPaletteColor(6, TFT_GREEN);
-  imageCanvas.setPaletteColor(7, 0xC618);  // light gray
 
   sdReady = mountSdCardWithRetry();
   Serial.printf("SD card: %s\n", sdReady ? "OK" : "not found");
@@ -890,7 +887,6 @@ void setup() {
   // clock UI. Runtime image changes then need no SD/LCD bus handover.
   sdReady = cacheSdPictures();
   SD.end();
-  imageCanvas.deleteSprite();
 
   // Preflight the SD artwork for the source indicator without refreshing the
   // e-paper. Manual and scheduled updates select the cached EPD pixels.
