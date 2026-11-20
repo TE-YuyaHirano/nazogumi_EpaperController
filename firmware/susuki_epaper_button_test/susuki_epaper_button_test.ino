@@ -250,9 +250,19 @@ uint8_t nearestEpdColor(uint16_t rgb565) {
 }
 
 bool loadSdPicture(Picture picture) {
-  if (!sdReady) return false;
   const char* path = picture == Picture::OpenEyes ? SD_OPEN_PATH : SD_CLOSED_PATH;
-  if (!SD.exists(path)) return false;
+  if (!sdReady || !SD.exists(path)) {
+    Serial.printf("SD asset unavailable before remount: ready=%d path=%s\n",
+                  sdReady, path);
+    SD.end();
+    delay(20);
+    sdReady = SD.begin(GPIO_NUM_4, SPI, 25000000);
+    Serial.printf("SD remount: %s\n", sdReady ? "OK" : "failed");
+  }
+  if (!sdReady || !SD.exists(path)) {
+    Serial.printf("SD asset missing after remount: %s\n", path);
+    return false;
+  }
 
   imageCanvas.fillScreen(TFT_WHITE);
   // SD artwork is 480x800 portrait. Decode at half scale to a 240x400
