@@ -38,7 +38,7 @@ constexpr char SD_CLOSED_PATH[] = "/assets/me_close.jpg";
 constexpr char SD_OPEN_PATH[] = "/assets/me_open.jpg";
 constexpr char SD_SETTING_PATH[] = "/setting.txt";
 constexpr char SD_TEST_ASSET_MARKER_PATH[] =
-  "/assets/.distinct_test_images_v1";
+  "/assets/.distinct_test_images_v2";
 
 struct ScheduleConfig {
   uint8_t initialHour = 12;
@@ -94,7 +94,7 @@ void installDistinctSdTestAssets() {
 
   File marker = SD.open(SD_TEST_ASSET_MARKER_PATH, FILE_WRITE);
   if (marker) {
-    marker.println("distinct-test-images-v1");
+    marker.println("distinct-test-images-v2");
     marker.close();
     Serial.println("Distinct SD test artwork installed");
   }
@@ -691,10 +691,6 @@ void handleButtons() {
         editField = 0;
         bootClockSetup = false;
         uiScreen = UiScreen::Home;
-        // Every boot starts from a known closed-eye state. Resolving the
-        // picture here also makes the home screen report SD CARD immediately
-        // when the SD asset is available.
-        showPicture(Picture::ClosedEyes, true);
         drawHome();
         applySchedule();
         return;
@@ -808,6 +804,11 @@ void setup() {
   Serial.printf("SD card: %s\n", sdReady ? "OK" : "not found");
   installDistinctSdTestAssets();
   loadSettings();
+
+  // Preflight the SD artwork for the source indicator without refreshing the
+  // e-paper. A manual or scheduled update will decode its requested image
+  // again immediately before sending it to the panel.
+  sdImageReady = loadSdPicture(Picture::ClosedEyes);
 
   // The mandatory boot-time clock screen starts from INITIAL_TIME in
   // setting.txt. This makes setup deterministic even when the RTC is invalid.
