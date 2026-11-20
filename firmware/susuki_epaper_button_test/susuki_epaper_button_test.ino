@@ -13,6 +13,7 @@ constexpr int EPD_DC   = 17;  // T2
 constexpr int EPD_RST  = 22;  // bottom terminal labeled SCL
 constexpr int EPD_BUSY = 35;
 constexpr int EPD_PWR  = 26;  // second DA (DAC2)
+constexpr int M5_SD_CS  = 4;
 
 constexpr int EPD_WIDTH  = 800;
 constexpr int EPD_HEIGHT = 480;
@@ -52,7 +53,27 @@ struct ScheduleConfig {
 ScheduleConfig scheduleConfig;
 bool sdReady = false;
 bool sdImageReady = false;
-M5Canvas imageCanvas(&M5.Display);
+// Standalone conversion canvas: it must not inherit LCD bus callbacks.
+M5Canvas imageCanvas;
+constexpr size_t SD_PACKED_IMAGE_BYTES = 240 * 400 / 2;
+uint8_t* sdClosedPixels = nullptr;
+uint8_t* sdOpenPixels = nullptr;
+
+bool mountSdCardWithRetry() {
+  // Let the card finish powering up after upload/reset. Use the same simple
+  // initialization sequence that is known to work on this M5Basic.
+  delay(1000);
+
+  for (int attempt = 1; attempt <= 6; ++attempt) {
+    const bool mounted = SD.begin(M5_SD_CS, SPI, 25000000);
+    Serial.printf("SD mount attempt %d/6: %s\n", attempt,
+                  mounted ? "OK" : "failed");
+    if (mounted) return true;
+    SD.end();
+    delay(250);
+  }
+  return false;
+}
 
 bool writeEmbeddedSdAsset(const char* path,
                           const uint8_t* data,
@@ -249,29 +270,68 @@ uint8_t nearestEpdColor(uint16_t rgb565) {
   return bestCode;
 }
 
-bool loadSdPicture(Picture picture) {
-  const char* path = picture == Picture::OpenEyes ? SD_OPEN_PATH : SD_CLOSED_PATH;
-  if (!sdReady || !SD.exists(path)) {
-    Serial.printf("SD asset unavailable before remount: ready=%d path=%s\n",
-                  sdReady, path);
-    SD.end();
-    delay(20);
-    sdReady = SD.begin(GPIO_NUM_4, SPI, 25000000);
-    Serial.printf("SD remount: %s\n", sdReady ? "OK" : "failed");
-  }
-  if (!sdReady || !SD.exists(path)) {
-    Serial.printf("SD asset missing after remount: %s\n", path);
+bool cacheSdPicture(const char* path, uint8_t** destination) {
+  if (!SD.exists(path)) {
+    Serial.printf("Cache open failed: %s\n", path);
     return false;
   }
 
   imageCanvas.fillScreen(TFT_WHITE);
-  // SD artwork is 480x800 portrait. Decode at half scale to a 240x400
-  // canvas, then duplicate each pixel while streaming to the 800x480 panel.
-  fs::FS& sdFileSystem = SD;
-  const bool ok = imageCanvas.drawJpgFile(sdFileSystem, path, 0, 0, 240, 400,
-                                           0, 0, 0.5f, 0.5f);
-  Serial.printf("SD image %s: %s\n", path, ok ? "OK" : "decode failed");
-  return ok;
+  // The conversion canvas is standalone, so decoding directly from the SD
+  // file no longer invokes LCD bus callbacks and needs no full-JPEG buffer.
+  const bool decoded = imageCanvas.drawJpgFile(
+    SD, path, 0, 0, 240, 400, 0, 0, 0.5f, 0.5f);
+  if (!decoded) {
+    Serial.printf("Cache JPEG decode failed: %s\n", path);
+    return false;
+  }
+
+  *destination = static_cast<uint8_t*>(malloc(SD_PACKED_IMAGE_BYTES));
+  if (!*destination) {
+    Serial.printf("Cache pixel allocation failed: %s, free=%u\n", path,
+                  static_cast<unsigned>(ESP.getFreeHeap()));
+    return false;
+  }
+  size_t index = 0;
+  for (int y = 0; y < 400; ++y) {
+    for (int x = 0; x < 240; x += 2) {
+      const uint8_t first = nearestEpdColor(imageCanvas.readPixel(x, y));
+      const uint8_t second = nearestEpdColor(imageCanvas.readPixel(x + 1, y));
+      (*destination)[index++] = (first << 4) | second;
+    }
+  }
+  Serial.printf("Cached %s as %u-byte EPD pixels; free=%u\n", path,
+                static_cast<unsigned>(SD_PACKED_IMAGE_BYTES),
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  return true;
+}
+
+bool cacheSdPictures() {
+  if (!sdReady) return false;
+  const bool closedOk = cacheSdPicture(SD_CLOSED_PATH, &sdClosedPixels);
+  const bool openOk = cacheSdPicture(SD_OPEN_PATH, &sdOpenPixels);
+  Serial.printf("SD image cache: close=%s, open=%s, free=%u\n",
+                closedOk ? "OK" : "failed",
+                openOk ? "OK" : "failed",
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  if (closedOk && openOk) return true;
+  free(sdClosedPixels);
+  free(sdOpenPixels);
+  sdClosedPixels = nullptr;
+  sdOpenPixels = nullptr;
+  return false;
+}
+
+bool loadSdPicture(Picture picture) {
+  const char* path = picture == Picture::OpenEyes ? SD_OPEN_PATH : SD_CLOSED_PATH;
+  const uint8_t* pixels = picture == Picture::OpenEyes
+                            ? sdOpenPixels : sdClosedPixels;
+  if (!pixels) {
+    Serial.printf("SD image not cached: %s\n", path);
+    return false;
+  }
+  Serial.printf("SD image cache selected: %s\n", path);
+  return true;
 }
 
 void streamEmbeddedPicture(Picture picture) {
@@ -284,14 +344,17 @@ void streamEmbeddedPicture(Picture picture) {
   }
 }
 
-void streamSdPicture() {
+void streamSdPicture(Picture picture) {
+  const uint8_t* pixels = picture == Picture::OpenEyes
+                            ? sdOpenPixels : sdClosedPixels;
   // Controller-native coordinates are 800x480 landscape. The physical panel
   // is portrait, so this performs the same CCW rotation as the built-in data.
   for (int controllerY = 0; controllerY < EPD_HEIGHT; ++controllerY) {
     const int canvasX = (EPD_HEIGHT - 1 - controllerY) / 2;
     for (int byteX = 0; byteX < EPD_WIDTH / 2; ++byteX) {
       const int canvasY = byteX;
-      const uint8_t code = nearestEpdColor(imageCanvas.readPixel(canvasX, canvasY));
+      const uint8_t packed = pixels[canvasY * 120 + canvasX / 2];
+      const uint8_t code = (canvasX & 1) ? (packed & 0x0F) : (packed >> 4);
       epdSpiWrite((code << 4) | code);
     }
   }
@@ -305,7 +368,7 @@ bool refreshPanel(Picture picture) {
   epdCommand(0x10); // start image data
   digitalWrite(EPD_DC, HIGH);
   digitalWrite(EPD_CS, LOW);
-  if (sdImageReady) streamSdPicture();
+  if (sdImageReady) streamSdPicture(picture);
   else streamEmbeddedPicture(picture);
   digitalWrite(EPD_CS, HIGH);
 
@@ -716,10 +779,10 @@ void handleButtons() {
       uiScreen = UiScreen::Menu;
       drawMenu();
     } else if (uiButtonAWasPressed()) {
-      showPicture(Picture::ClosedEyes);
+      showPicture(Picture::ClosedEyes, true);
       drawHome();
     } else if (uiButtonCWasPressed()) {
-      showPicture(Picture::OpenEyes);
+      showPicture(Picture::OpenEyes, true);
       drawHome();
     }
     return;
@@ -805,19 +868,32 @@ void setup() {
   digitalWrite(EPD_MOSI, LOW);
   digitalWrite(EPD_SCLK, LOW);
 
-  imageCanvas.setColorDepth(8);
+  imageCanvas.setColorDepth(4);
   if (!imageCanvas.createSprite(240, 400)) {
     Serial.println("Could not allocate SD image canvas");
   }
+  imageCanvas.setPaletteColor(0, TFT_BLACK);
+  imageCanvas.setPaletteColor(1, TFT_WHITE);
+  imageCanvas.setPaletteColor(2, TFT_YELLOW);
+  imageCanvas.setPaletteColor(3, TFT_RED);
+  imageCanvas.setPaletteColor(4, 0x7BEF);  // mid gray
+  imageCanvas.setPaletteColor(5, TFT_BLUE);
+  imageCanvas.setPaletteColor(6, TFT_GREEN);
+  imageCanvas.setPaletteColor(7, 0xC618);  // light gray
 
-  sdReady = SD.begin(GPIO_NUM_4, SPI, 25000000);
+  sdReady = mountSdCardWithRetry();
   Serial.printf("SD card: %s\n", sdReady ? "OK" : "not found");
   installDistinctSdTestAssets();
   loadSettings();
 
+  // Cache both JPEGs while the SD bus is known-good, before drawing the
+  // clock UI. Runtime image changes then need no SD/LCD bus handover.
+  sdReady = cacheSdPictures();
+  SD.end();
+  imageCanvas.deleteSprite();
+
   // Preflight the SD artwork for the source indicator without refreshing the
-  // e-paper. A manual or scheduled update will decode its requested image
-  // again immediately before sending it to the panel.
+  // e-paper. Manual and scheduled updates select the cached EPD pixels.
   sdImageReady = loadSdPicture(Picture::ClosedEyes);
 
   // The mandatory boot-time clock screen starts from INITIAL_TIME in
@@ -830,8 +906,40 @@ void setup() {
   drawClockSet();
 }
 
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  const char command = static_cast<char>(Serial.read());
+  if (command == 'a' || command == 'A') {
+    Serial.println("UART TEST: CLOSE");
+    showPicture(Picture::ClosedEyes, true);
+  } else if (command == 'c' || command == 'C') {
+    Serial.println("UART TEST: OPEN");
+    showPicture(Picture::OpenEyes, true);
+  } else if (command == 't' || command == 'T') {
+    Serial.println("UART TEST: BEGIN CLOSE-OPEN-CLOSE");
+    const Picture sequence[] = {
+      Picture::ClosedEyes, Picture::OpenEyes, Picture::ClosedEyes,
+    };
+    for (size_t i = 0; i < 3; ++i) {
+      Serial.printf("UART TEST: STEP %u/3 %s\n",
+                    static_cast<unsigned>(i + 1),
+                    sequence[i] == Picture::OpenEyes ? "OPEN" : "CLOSE");
+      const bool ok = showPicture(sequence[i], true) && sdImageReady;
+      Serial.printf("UART TEST: STEP %u %s\n",
+                    static_cast<unsigned>(i + 1), ok ? "PASS" : "FAIL");
+      if (!ok) break;
+    }
+    Serial.println("UART TEST: END");
+  } else if (command == 'r' || command == 'R') {
+    Serial.println("UART RESET");
+    Serial.flush();
+    ESP.restart();
+  }
+}
+
 void loop() {
   M5.update();
+  handleSerialCommands();
   const bool consumedWakePress = updateLcdWakeState();
   if (!consumedWakePress) handleButtons();
 
