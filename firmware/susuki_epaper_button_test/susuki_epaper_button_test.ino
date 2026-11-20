@@ -2,6 +2,7 @@
 #include <M5Unified.h>
 #include <soc/gpio_struct.h>
 #include "epaper_portraits.h"
+#include "sd_test_assets_embedded.h"
 
 // M5Stack Basic v2.7 terminals -> Waveshare RPi Zero PhotoPainter
 // EPD_RST uses the bottom SCL terminal / GPIO22 to avoid GPIO25.
@@ -36,6 +37,8 @@ bool hasDisplayedPicture = false;
 constexpr char SD_CLOSED_PATH[] = "/assets/me_close.jpg";
 constexpr char SD_OPEN_PATH[] = "/assets/me_open.jpg";
 constexpr char SD_SETTING_PATH[] = "/setting.txt";
+constexpr char SD_TEST_ASSET_MARKER_PATH[] =
+  "/assets/.distinct_test_images_v1";
 
 struct ScheduleConfig {
   uint8_t initialHour = 12;
@@ -50,6 +53,52 @@ ScheduleConfig scheduleConfig;
 bool sdReady = false;
 bool sdImageReady = false;
 M5Canvas imageCanvas(&M5.Display);
+
+bool writeEmbeddedSdAsset(const char* path,
+                          const uint8_t* data,
+                          size_t length) {
+  if (SD.exists(path) && !SD.remove(path)) {
+    Serial.printf("Could not replace %s\n", path);
+    return false;
+  }
+
+  File output = SD.open(path, FILE_WRITE);
+  if (!output) {
+    Serial.printf("Could not create %s\n", path);
+    return false;
+  }
+  const size_t written = output.write(data, length);
+  output.close();
+  Serial.printf("Installed %s: %u/%u bytes\n", path,
+                static_cast<unsigned>(written),
+                static_cast<unsigned>(length));
+  return written == length;
+}
+
+void installDistinctSdTestAssets() {
+  if (!sdReady || SD.exists(SD_TEST_ASSET_MARKER_PATH)) return;
+
+  if (!SD.exists("/assets") && !SD.mkdir("/assets")) {
+    Serial.println("Could not create /assets on SD card");
+    return;
+  }
+
+  const bool closeOk = writeEmbeddedSdAsset(
+    SD_CLOSED_PATH, SD_TEST_CLOSE_JPG, SD_TEST_CLOSE_JPG_len);
+  const bool openOk = writeEmbeddedSdAsset(
+    SD_OPEN_PATH, SD_TEST_OPEN_JPG, SD_TEST_OPEN_JPG_len);
+  if (!closeOk || !openOk) {
+    Serial.println("SD test artwork install incomplete; retry next boot");
+    return;
+  }
+
+  File marker = SD.open(SD_TEST_ASSET_MARKER_PATH, FILE_WRITE);
+  if (marker) {
+    marker.println("distinct-test-images-v1");
+    marker.close();
+    Serial.println("Distinct SD test artwork installed");
+  }
+}
 
 void epdSpiWrite(uint8_t value) {
   // Software SPI prevents contention with the M5Stack internal LCD SPI bus.
@@ -753,6 +802,7 @@ void setup() {
 
   sdReady = SD.begin(GPIO_NUM_4, SPI, 25000000);
   Serial.printf("SD card: %s\n", sdReady ? "OK" : "not found");
+  installDistinctSdTestAssets();
   loadSettings();
 
   // The mandatory boot-time clock screen starts from INITIAL_TIME in
