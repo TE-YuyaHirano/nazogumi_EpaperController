@@ -691,6 +691,10 @@ void handleButtons() {
         editField = 0;
         bootClockSetup = false;
         uiScreen = UiScreen::Home;
+        // Every boot starts from a known closed-eye state. Resolving the
+        // picture here also makes the home screen report SD CARD immediately
+        // when the SD asset is available.
+        showPicture(Picture::ClosedEyes, true);
         drawHome();
         applySchedule();
         return;
