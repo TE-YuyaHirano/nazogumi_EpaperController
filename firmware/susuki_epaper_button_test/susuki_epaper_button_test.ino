@@ -287,6 +287,13 @@ bool softwareClockRunning = false;
 uint32_t softwareClockBaseSeconds = 0;
 uint32_t softwareClockSetAtMs = 0;
 
+// Keep the controller unobtrusive in the dark. A button press wakes only the
+// M5Basic LCD; the user presses again to perform the intended operation.
+constexpr uint8_t LCD_ACTIVE_BRIGHTNESS = 96;
+constexpr uint32_t LCD_TIMEOUT_MS = 20000;
+bool lcdAwake = true;
+uint32_t lastLcdInteractionMs = 0;
+
 const char* imageSourceLabel() {
   return sdImageReady ? "SD CARD" : "BUILT-IN";
 }
@@ -594,6 +601,26 @@ bool uiButtonAWasPressed() { return M5.BtnC.wasPressed(); }
 bool uiButtonBWasPressed() { return M5.BtnB.wasPressed(); }
 bool uiButtonCWasPressed() { return M5.BtnA.wasPressed(); }
 
+bool updateLcdWakeState() {
+  const bool anyButtonPressed = M5.BtnA.wasPressed()
+                             || M5.BtnB.wasPressed()
+                             || M5.BtnC.wasPressed();
+  if (anyButtonPressed) {
+    lastLcdInteractionMs = millis();
+    if (!lcdAwake) {
+      M5.Display.setBrightness(LCD_ACTIVE_BRIGHTNESS);
+      lcdAwake = true;
+      return true; // Consume the wake-up press; do not change EPD/UI state.
+    }
+  }
+
+  if (lcdAwake && millis() - lastLcdInteractionMs >= LCD_TIMEOUT_MS) {
+    M5.Display.setBrightness(0);
+    lcdAwake = false;
+  }
+  return false;
+}
+
 void handleButtons() {
   if (uiScreen == UiScreen::ClockSet) {
     bool redraw = false;
@@ -702,6 +729,8 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(3); // M5Basic is mounted upside down on the bridge board.
+  M5.Display.setBrightness(LCD_ACTIVE_BRIGHTNESS);
+  lastLcdInteractionMs = millis();
   M5.Speaker.end(); // Keep the internal speaker explicitly disabled.
   Serial.begin(115200);
 
@@ -738,7 +767,8 @@ void setup() {
 
 void loop() {
   M5.update();
-  handleButtons();
+  const bool consumedWakePress = updateLcdWakeState();
+  if (!consumedWakePress) handleButtons();
 
   if (uiScreen == UiScreen::Home && millis() >= nextScheduleCheck) {
     nextScheduleCheck = millis() + 15000;
